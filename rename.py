@@ -58,10 +58,6 @@ _EP_PATTERNS = [
         r"\b(?P<season>\d{1,2})x(?P<episode>\d{2,3})\b",
         re.IGNORECASE,
     ),
-    # Absolute three-digit (anime-style):  101  →  season 1, episode 01
-    re.compile(
-        r"\b(?P<season>[1-9])(?P<episode>\d{2})\b",
-    ),
     # Bare episode keyword:  Ep01 / Episode 1 / ep.03
     re.compile(
         r"\b[Ee]p(?:isode)?\.?\s*(?P<episode>\d{1,3})\b",
@@ -77,6 +73,57 @@ _EP_PATTERNS = [
 # Hyphens are handled separately so that compound words like "Thirty-Seven"
 # are preserved while edge/isolated hyphens are removed.
 _DOT_UNDER_RE = re.compile(r"[._\s]+")
+
+
+def load_env_file(file_path: str = ".env", override: bool = False) -> int:
+    """Load environment variables from a .env-style file.
+
+    Lines must be in ``KEY=VALUE`` form. Empty lines and comments are ignored.
+    If *override* is ``False`` (default), existing environment variables are
+    preserved.
+
+    Returns the number of variables loaded.
+    """
+    if not os.path.isfile(file_path):
+        return 0
+
+    loaded = 0
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if line.startswith("export "):
+                    line = line[len("export ") :].strip()
+
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+
+                if not key:
+                    continue
+
+                if (
+                    len(value) >= 2
+                    and value[0] == value[-1]
+                    and value[0] in {'"', "'"}
+                ):
+                    value = value[1:-1]
+
+                if not override and key in os.environ:
+                    continue
+
+                os.environ[key] = value
+                loaded += 1
+    except OSError as exc:
+        log.warning("Could not read %s: %s", file_path, exc)
+
+    return loaded
 
 
 def _clean(text: str) -> str:
@@ -160,7 +207,12 @@ def _infer_show_name_from_path(filepath: str, base_folder: str) -> str:
     return ""
 
 
-def rename_file(filepath: str, base_folder: str, dry_run: bool = False) -> bool:
+def rename_file(
+    filepath: str,
+    base_folder: str,
+    dry_run: bool = False,
+    default_season=None,
+) -> bool:
     """Attempt to rename *filepath* to a Jellyfin-compliant name.
 
     Returns ``True`` if a rename was performed (or would be in dry-run mode).
@@ -175,6 +227,9 @@ def rename_file(filepath: str, base_folder: str, dry_run: bool = False) -> bool:
         return False
 
     show_name, season, episode, episode_title = parsed
+
+    if season is None and default_season is not None:
+        season = default_season
 
     # The folder name is the most reliable source for the show name; use it
     # whenever the file lives inside a named subdirectory of the base folder.
@@ -216,13 +271,41 @@ def process_folder(folder: str, dry_run: bool = False):
     skipped = 0
 
     for root, _dirs, files in os.walk(folder):
+        inferred_season = None
+
+        # Infer a season for this directory from files that explicitly
+        # include one (e.g. S01E01, 2x04). If exactly one distinct season is
+        # found, use it as fallback for seasonless files in the same folder.
+        seasons_found = set()
+        for fname in files:
+            _, ext = os.path.splitext(fname)
+            if ext.lower() not in VIDEO_EXTENSIONS:
+                continue
+
+            stem, _ = os.path.splitext(fname)
+            parsed = parse_filename(stem)
+            if parsed is None:
+                continue
+
+            _, season, _episode, _title = parsed
+            if season is not None:
+                seasons_found.add(season)
+
+        if len(seasons_found) == 1:
+            inferred_season = next(iter(seasons_found))
+
         for fname in sorted(files):
             _, ext = os.path.splitext(fname)
             if ext.lower() not in VIDEO_EXTENSIONS:
                 continue
 
             filepath = os.path.join(root, fname)
-            result = rename_file(filepath, folder, dry_run=dry_run)
+            result = rename_file(
+                filepath,
+                folder,
+                dry_run=dry_run,
+                default_season=inferred_season,
+            )
             if result:
                 renamed += 1
             else:
@@ -237,6 +320,8 @@ def process_folder(folder: str, dry_run: bool = False):
 
 
 def main():
+    load_env_file()
+
     media_folder = os.environ.get("MEDIA_FOLDER", "").strip()
     if not media_folder:
         log.error(

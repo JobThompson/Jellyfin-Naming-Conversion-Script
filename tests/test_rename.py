@@ -4,12 +4,19 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 # Adjust path so we can import rename.py from the repo root
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rename import parse_filename, build_jellyfin_name, rename_file, process_folder
+from rename import (
+    parse_filename,
+    build_jellyfin_name,
+    rename_file,
+    process_folder,
+    load_env_file,
+)
 
 
 class TestParseFilename(unittest.TestCase):
@@ -65,21 +72,21 @@ class TestParseFilename(unittest.TestCase):
         self.assertEqual(title, "Episode Title")
 
     # ------------------------------------------------------------------
-    # Absolute three-digit numbering (anime style)
+    # Three-digit episode numbering
     # ------------------------------------------------------------------
-    def test_absolute_three_digit(self):
+    def test_three_digit_episode_not_interpreted_as_season_split(self):
         result = parse_filename("Anime.Show.101.Episode.Title")
         self.assertIsNotNone(result)
         _, season, episode, _ = result
-        self.assertEqual(season, 1)
-        self.assertEqual(episode, 1)
+        self.assertIsNone(season)
+        self.assertEqual(episode, 101)
 
-    def test_absolute_three_digit_episode_12(self):
+    def test_three_digit_episode_212(self):
         result = parse_filename("Anime.Show.212")
         self.assertIsNotNone(result)
         _, season, episode, _ = result
-        self.assertEqual(season, 2)
-        self.assertEqual(episode, 12)
+        self.assertIsNone(season)
+        self.assertEqual(episode, 212)
 
     # ------------------------------------------------------------------
     # Episode keyword patterns
@@ -285,6 +292,76 @@ class TestProcessFolder(unittest.TestCase):
         self.assertTrue(os.path.exists(fp))
         expected = os.path.join(self.tmp, "Show - S01E05 - Title.mp4")
         self.assertFalse(os.path.exists(expected))
+
+    def test_high_episode_number_inherits_folder_season(self):
+        self._make_file("Show", "Season 01", "Show.S01E01.Pilot.mkv")
+        self._make_file("Show", "Season 01", "Show.101.The.Long.Road.mkv")
+        process_folder(self.tmp)
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(
+                    self.tmp,
+                    "Show",
+                    "Season 01",
+                    "Show - S01E01 - Pilot.mkv",
+                )
+            )
+        )
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(
+                    self.tmp,
+                    "Show",
+                    "Season 01",
+                    "Show - S01E101 - The Long Road.mkv",
+                )
+            )
+        )
+
+
+class TestLoadEnvFile(unittest.TestCase):
+    """Unit tests for load_env_file()."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.env_path = os.path.join(self.tmp, ".env")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_loads_values_from_dotenv(self):
+        with open(self.env_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "# comment\n"
+                "MEDIA_FOLDER= C:/Media/TV \n"
+                "DRY_RUN='1'\n"
+                "export EXTRA_VAR=extra\n"
+            )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            loaded = load_env_file(self.env_path)
+            self.assertEqual(loaded, 3)
+            self.assertEqual(os.environ.get("MEDIA_FOLDER"), "C:/Media/TV")
+            self.assertEqual(os.environ.get("DRY_RUN"), "1")
+            self.assertEqual(os.environ.get("EXTRA_VAR"), "extra")
+
+    def test_does_not_override_existing_by_default(self):
+        with open(self.env_path, "w", encoding="utf-8") as handle:
+            handle.write("DRY_RUN=1\n")
+
+        with mock.patch.dict(os.environ, {"DRY_RUN": "0"}, clear=True):
+            loaded = load_env_file(self.env_path)
+            self.assertEqual(loaded, 0)
+            self.assertEqual(os.environ.get("DRY_RUN"), "0")
+
+    def test_override_replaces_existing_value(self):
+        with open(self.env_path, "w", encoding="utf-8") as handle:
+            handle.write("DRY_RUN=1\n")
+
+        with mock.patch.dict(os.environ, {"DRY_RUN": "0"}, clear=True):
+            loaded = load_env_file(self.env_path, override=True)
+            self.assertEqual(loaded, 1)
+            self.assertEqual(os.environ.get("DRY_RUN"), "1")
 
 
 if __name__ == "__main__":

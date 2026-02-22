@@ -22,7 +22,7 @@ The script recognises many common filename conventions automatically:
 |---------|---------|
 | Standard `SxxExx` | `Show.Name.S01E01.Pilot.mkv` |
 | Alternate `NxNN` | `Show Name - 2x04 - Episode Title.mp4` |
-| Absolute three-digit (anime) | `Show.Name.101.Episode.Title.mkv` |
+| Three-digit episode number | `Show.Name.101.Episode.Title.mkv` |
 | Episode keyword | `Show Name Ep03 Title.mkv` / `Episode 7` |
 | Bare episode number | `05 - Title.mkv` / `01.mkv` |
 
@@ -56,6 +56,14 @@ DRY_RUN=1 MEDIA_FOLDER=/path/to/your/tv-shows python rename.py
 |----------|----------|---------|-------------|
 | `MEDIA_FOLDER` | **Yes** | — | Path to the root folder containing media files |
 | `DRY_RUN` | No | `0` | Set to `1` to preview renames without changing files |
+
+The script automatically reads a local `.env` file (if present) before
+checking environment variables, so you can place settings there:
+
+```dotenv
+MEDIA_FOLDER=C:/path/to/your/tv-shows
+DRY_RUN=1
+```
 
 ### Example
 
