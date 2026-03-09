@@ -235,6 +235,10 @@ class TestBuildPrompt(unittest.TestCase):
 class TestCallAI(unittest.TestCase):
     """Unit tests for _call_ai() with mocked HTTP responses."""
 
+    _BASE_URL = "https://api.openai.com/v1"
+    _MODEL = "gpt-4o-mini"
+    _KEY = "fake-key"
+
     def _mock_response(self, content_text):
         """Create a mock urllib response."""
         body = json.dumps({
@@ -261,9 +265,7 @@ class TestCallAI(unittest.TestCase):
                 }
             })
         )
-        result = _call_ai(
-            "test", "fake-key", "https://api.openai.com/v1", "gpt-4o-mini",
-        )
+        result = _call_ai("test", self._KEY, self._BASE_URL, self._MODEL)
         self.assertEqual(result[1]["title"], "Pilot")
         self.assertEqual(result[1]["imdb_id"], "tt0959621")
         self.assertEqual(result[1]["aired"], "2008-01-20")
@@ -275,9 +277,7 @@ class TestCallAI(unittest.TestCase):
         mock_urlopen.return_value = self._mock_response(
             '{"1": "Pilot"}'
         )
-        result = _call_ai(
-            "test", "fake-key", "https://api.openai.com/v1", "gpt-4o-mini",
-        )
+        result = _call_ai("test", self._KEY, self._BASE_URL, self._MODEL)
         self.assertEqual(result[1]["title"], "Pilot")
         self.assertIsNone(result[1]["imdb_id"])
 
@@ -287,17 +287,13 @@ class TestCallAI(unittest.TestCase):
             '```json\n{"1": {"title": "Pilot", "imdb_id": null, '
             '"aired": null, "plot": null}}\n```'
         )
-        result = _call_ai(
-            "test", "fake-key", "https://api.openai.com/v1", "gpt-4o-mini",
-        )
+        result = _call_ai("test", self._KEY, self._BASE_URL, self._MODEL)
         self.assertEqual(result[1]["title"], "Pilot")
 
     @mock.patch("ai_rename.urllib.request.urlopen")
     def test_invalid_json_returns_empty(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_response("not json at all")
-        result = _call_ai(
-            "test", "fake-key", "https://api.openai.com/v1", "gpt-4o-mini",
-        )
+        result = _call_ai("test", self._KEY, self._BASE_URL, self._MODEL)
         self.assertEqual(result, {})
 
     @mock.patch("ai_rename.urllib.request.urlopen")
@@ -306,14 +302,16 @@ class TestCallAI(unittest.TestCase):
         mock_urlopen.side_effect = urllib.error.HTTPError(
             "url", 401, "Unauthorized", {}, None,
         )
-        result = _call_ai(
-            "test", "fake-key", "https://api.openai.com/v1", "gpt-4o-mini",
-        )
+        result = _call_ai("test", self._KEY, self._BASE_URL, self._MODEL)
         self.assertEqual(result, {})
 
 
 class TestQueryEpisodeMetadata(unittest.TestCase):
     """Unit tests for query_episode_metadata() with mocked _call_ai."""
+
+    _BASE_URL = "https://api.openai.com/v1"
+    _MODEL = "gpt-4o-mini"
+    _KEY = "fake-key"
 
     @mock.patch("ai_rename._call_ai")
     def test_single_batch(self, mock_call):
@@ -321,7 +319,7 @@ class TestQueryEpisodeMetadata(unittest.TestCase):
             1: {"title": "Pilot", "imdb_id": "tt1", "aired": None, "plot": None},
         }
         result = query_episode_metadata(
-            "Show", 1, [1], "key", "https://api.openai.com/v1", "gpt-4o-mini",
+            "Show", 1, [1], self._KEY, self._BASE_URL, self._MODEL,
         )
         self.assertEqual(result[1]["title"], "Pilot")
         mock_call.assert_called_once()
@@ -339,7 +337,7 @@ class TestQueryEpisodeMetadata(unittest.TestCase):
             },
         ]
         result = query_episode_metadata(
-            "Show", None, [1, 2, 3], "key", "https://api.openai.com/v1", "gpt-4o-mini",
+            "Show", None, [1, 2, 3], self._KEY, self._BASE_URL, self._MODEL,
         )
         self.assertEqual(len(result), 3)
         self.assertEqual(result[3]["title"], "Third")
