@@ -91,6 +91,7 @@ _SEASON_FOLDER_RE = re.compile(
 
 # Replace dots, underscores, and whitespace runs with a single space.
 _DOT_UNDER_RE = re.compile(r"[._\s]+")
+_INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +156,18 @@ def _clean(text: str) -> str:
     return re.sub(r" {2,}", " ", text).strip()
 
 
+def _safe_filename_component(text: str) -> str:
+    """Sanitise text so it is safe to use as part of a filename.
+
+    AI-returned episode titles can contain characters that are invalid on
+    Windows (for example ":"), so normalise those before building paths.
+    """
+    cleaned = _INVALID_FILENAME_CHARS_RE.sub(" ", text)
+    cleaned = _clean(cleaned)
+    # Windows disallows trailing dots/spaces in path components.
+    return cleaned.rstrip(" .")
+
+
 # ---------------------------------------------------------------------------
 # Filename / path analysis
 # ---------------------------------------------------------------------------
@@ -177,12 +190,17 @@ def parse_season_from_folder(folder_name: str):
 
 
 def infer_show_name(filepath: str, base_folder: str) -> str:
-    """Return the show name from the top-level folder under *base_folder*."""
+    """Infer the show name from path context.
+
+    If *base_folder* is a library root, the first folder under it is treated
+    as the show name. If *base_folder* is already a single show folder,
+    fallback to that folder name.
+    """
     rel = os.path.relpath(filepath, base_folder)
     parts = rel.split(os.sep)
     if len(parts) > 1:
         return _clean(parts[0])
-    return ""
+    return _clean(os.path.basename(os.path.normpath(base_folder)))
 
 
 def infer_season(filepath: str, base_folder: str):
@@ -193,8 +211,18 @@ def infer_season(filepath: str, base_folder: str):
     """
     rel = os.path.relpath(filepath, base_folder)
     parts = rel.split(os.sep)
-    # parts[0] = show folder, parts[1:-1] = intermediate folders, parts[-1] = file
-    for part in parts[1:-1]:
+    # Directory parts only (exclude filename).
+    dir_parts = parts[:-1]
+
+    # If MEDIA_FOLDER is a library root and we have show/subfolders, skip the
+    # first directory because it is the show folder. If MEDIA_FOLDER is already
+    # a show folder, keep the first entry so folders like "Season 01" are seen.
+    if len(dir_parts) >= 2:
+        season_parts = dir_parts[1:]
+    else:
+        season_parts = dir_parts
+
+    for part in season_parts:
         season = parse_season_from_folder(part)
         if season is not None:
             return season
@@ -377,6 +405,9 @@ def build_jellyfin_name(
     """
     if not episode_title:
         episode_title = f"Episode {episode:02d}"
+
+    show_name = _safe_filename_component(show_name)
+    episode_title = _safe_filename_component(episode_title)
 
     if season is not None:
         ep_marker = f"S{season:02d}E{episode:02d}"

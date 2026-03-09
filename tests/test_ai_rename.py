@@ -84,12 +84,17 @@ class TestInferShowName(unittest.TestCase):
     def test_direct_child(self):
         base = "/media/tv"
         fp = "/media/tv/file.mkv"
-        self.assertEqual(infer_show_name(fp, base), "")
+        self.assertEqual(infer_show_name(fp, base), "tv")
 
     def test_show_folder_only(self):
         base = "/media/tv"
         fp = "/media/tv/Naruto/001.mkv"
         self.assertEqual(infer_show_name(fp, base), "Naruto")
+
+    def test_base_folder_as_show_folder(self):
+        base = "/media/tv/YuGiOh 5Ds"
+        fp = "/media/tv/YuGiOh 5Ds/001.mkv"
+        self.assertEqual(infer_show_name(fp, base), "YuGiOh 5Ds")
 
 
 class TestInferSeason(unittest.TestCase):
@@ -110,6 +115,11 @@ class TestInferSeason(unittest.TestCase):
         fp = "/media/tv/Show/S03/file.mkv"
         self.assertEqual(infer_season(fp, base), 3)
 
+    def test_show_root_with_season_folder(self):
+        base = "/media/tv/Show"
+        fp = "/media/tv/Show/Season 02/file.mkv"
+        self.assertEqual(infer_season(fp, base), 2)
+
 
 class TestBuildJellyfinName(unittest.TestCase):
     """Unit tests for build_jellyfin_name()."""
@@ -124,7 +134,7 @@ class TestBuildJellyfinName(unittest.TestCase):
 
     def test_single_season_with_title(self):
         name = build_jellyfin_name("Naruto", None, 1, "Enter: Naruto Uzumaki!")
-        self.assertEqual(name, "Naruto - E01 - Enter: Naruto Uzumaki!")
+        self.assertEqual(name, "Naruto - E01 - Enter Naruto Uzumaki!")
 
     def test_no_title_fallback(self):
         name = build_jellyfin_name("Show", 2, 5, "")
@@ -466,7 +476,7 @@ class TestProcessFolder(unittest.TestCase):
             os.path.exists(
                 os.path.join(
                     self.tmp, "Naruto",
-                    "Naruto - E01 - Enter: Naruto Uzumaki! [tt0409591].mkv",
+                    "Naruto - E01 - Enter Naruto Uzumaki! [tt0409591].mkv",
                 )
             )
         )
@@ -483,7 +493,7 @@ class TestProcessFolder(unittest.TestCase):
             os.path.exists(
                 os.path.join(
                     self.tmp, "Naruto",
-                    "Naruto - E01 - Enter: Naruto Uzumaki! [tt0409591].nfo",
+                    "Naruto - E01 - Enter Naruto Uzumaki! [tt0409591].nfo",
                 )
             )
         )
