@@ -170,6 +170,7 @@ and uses the `E01` format (no `S01` prefix).
 | `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | Base URL for the API endpoint |
 | `OPENAI_MODEL` | No | `gpt-4o-mini` | Model to use for metadata lookups |
 | `DRY_RUN` | No | `0` | Set to `1` to preview renames without changing files |
+| `DRY_RUN_FOLDER` | No | — | When `DRY_RUN=1`, write renamed copies and `.nfo` files into this folder instead of changing originals |
 
 Settings can also be placed in a `.env` file:
 
@@ -178,6 +179,7 @@ MEDIA_FOLDER=/path/to/your/tv-shows
 OPENAI_API_KEY=sk-your-key-here
 OPENAI_MODEL=gpt-4o-mini
 DRY_RUN=1
+DRY_RUN_FOLDER=C:/path/to/dryrun-output
 ```
 
 ### Running the script

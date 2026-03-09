@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ai_rename import (
     extract_episode_number,
+    extract_episode_title,
     parse_season_from_folder,
     infer_show_name,
     infer_season,
@@ -49,6 +50,17 @@ class TestExtractEpisodeNumber(unittest.TestCase):
 
     def test_no_episode(self):
         self.assertIsNone(extract_episode_number("no_episode_here"))
+
+
+class TestExtractEpisodeTitle(unittest.TestCase):
+    """Unit tests for extract_episode_title()."""
+
+    def test_extracts_title_after_numbered_episode(self):
+        stem = "Yu-Gi-Oh! 5D's - 001 - On Your Mark, Get Set, Duel!"
+        self.assertEqual(extract_episode_title(stem), "On Your Mark, Get Set, Duel!")
+
+    def test_no_title_fragment(self):
+        self.assertEqual(extract_episode_title("S01E05"), "")
 
 
 class TestParseSeasonFromFolder(unittest.TestCase):
@@ -315,6 +327,28 @@ class TestCallAI(unittest.TestCase):
         result = _call_ai("test", self._KEY, self._BASE_URL, self._MODEL)
         self.assertEqual(result, {})
 
+    @mock.patch("ai_rename.time.sleep", return_value=None)
+    @mock.patch("ai_rename.urllib.request.urlopen")
+    def test_retries_once_on_429_then_succeeds(self, mock_urlopen, _mock_sleep):
+        import urllib.error
+
+        first = urllib.error.HTTPError("url", 429, "Too Many Requests", {}, None)
+        second = self._mock_response(
+            json.dumps({
+                "1": {
+                    "title": "Pilot",
+                    "imdb_id": "tt0959621",
+                    "aired": "2008-01-20",
+                    "plot": "A chemistry teacher gets a diagnosis.",
+                }
+            })
+        )
+        mock_urlopen.side_effect = [first, second]
+
+        result = _call_ai("test", self._KEY, self._BASE_URL, self._MODEL)
+        self.assertEqual(result[1]["title"], "Pilot")
+        self.assertEqual(mock_urlopen.call_count, 2)
+
 
 class TestQueryEpisodeMetadata(unittest.TestCase):
     """Unit tests for query_episode_metadata() with mocked _call_ai."""
@@ -529,6 +563,39 @@ class TestProcessFolder(unittest.TestCase):
         )
 
     @mock.patch("ai_rename.query_episode_metadata")
+    def test_dry_run_folder_writes_staged_outputs(self, mock_query):
+        fp = self._make_file("Show", "Season 01", "S01E01.mkv")
+        dry_run_out = os.path.join(self.tmp, "_dryrun")
+        mock_query.return_value = {
+            1: {"title": "Pilot", "imdb_id": "tt123", "aired": None, "plot": None},
+        }
+
+        process_folder(
+            self.tmp,
+            api_key="fake",
+            dry_run=True,
+            dry_run_folder=dry_run_out,
+        )
+
+        # Original file is untouched.
+        self.assertTrue(os.path.exists(fp))
+
+        staged_video = os.path.join(
+            dry_run_out,
+            "Show",
+            "Season 01",
+            "Show - S01E01 - Pilot [tt123].mkv",
+        )
+        staged_nfo = os.path.join(
+            dry_run_out,
+            "Show",
+            "Season 01",
+            "Show - S01E01 - Pilot [tt123].nfo",
+        )
+        self.assertTrue(os.path.exists(staged_video))
+        self.assertTrue(os.path.exists(staged_nfo))
+
+    @mock.patch("ai_rename.query_episode_metadata")
     def test_fallback_title_when_ai_returns_empty(self, mock_query):
         self._make_file("Show", "Season 01", "S01E05.mkv")
         mock_query.return_value = {}
@@ -544,6 +611,30 @@ class TestProcessFolder(unittest.TestCase):
             self.tmp, "Show", "Season 01", "Show - S01E05 - Episode 05.nfo",
         )
         self.assertTrue(os.path.exists(nfo))
+
+    @mock.patch("ai_rename.query_episode_metadata")
+    def test_preserves_existing_filename_title_when_ai_returns_empty(self, mock_query):
+        self._make_file(
+            "YuGiOh 5Ds",
+            "Yu-Gi-Oh! 5D's - 001 - On Your Mark, Get Set, Duel!.mkv",
+        )
+        mock_query.return_value = {}
+
+        process_folder(self.tmp, api_key="fake")
+
+        expected = os.path.join(
+            self.tmp,
+            "YuGiOh 5Ds",
+            "YuGiOh 5Ds - E01 - On Your Mark, Get Set, Duel!.mkv",
+        )
+        self.assertTrue(os.path.exists(expected))
+
+        expected_nfo = os.path.join(
+            self.tmp,
+            "YuGiOh 5Ds",
+            "YuGiOh 5Ds - E01 - On Your Mark, Get Set, Duel!.nfo",
+        )
+        self.assertTrue(os.path.exists(expected_nfo))
 
     @mock.patch("ai_rename.query_episode_metadata")
     def test_does_not_overwrite_existing(self, mock_query):

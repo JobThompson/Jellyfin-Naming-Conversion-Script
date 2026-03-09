@@ -28,13 +28,18 @@ Configuration is done through environment variables (or a .env file):
   OPENAI_MODEL      Model to use for lookups.  Default: gpt-4o-mini
   DRY_RUN           Set to "1" to print what would be renamed without
                     actually renaming anything.  Default: 0 (off).
+    DRY_RUN_FOLDER    Optional output folder used when DRY_RUN=1. If set,
+                                        renamed copies and NFO files are written there, preserving
+                                        relative subfolders from MEDIA_FOLDER.
 """
 
 import json
 import logging
 import os
 import re
+import shutil
 import sys
+import time
 import urllib.error
 import urllib.request
 from xml.sax.saxutils import escape as xml_escape
@@ -181,6 +186,19 @@ def extract_episode_number(stem: str):
     return None
 
 
+def extract_episode_title(stem: str) -> str:
+    """Return an episode title fragment from *stem*, if present.
+
+    Uses the same episode marker patterns as ``extract_episode_number`` and
+    returns the cleaned text that appears after the episode marker.
+    """
+    for pattern in _EP_PATTERNS:
+        m = pattern.search(stem)
+        if m is not None:
+            return _clean(stem[m.end() :])
+    return ""
+
+
 def parse_season_from_folder(folder_name: str):
     """Return a season number from a folder name like ``Season 01``, or ``None``."""
     m = _SEASON_FOLDER_RE.search(folder_name)
@@ -234,6 +252,9 @@ def infer_season(filepath: str, base_folder: str):
 # ---------------------------------------------------------------------------
 
 _BATCH_SIZE = 50  # max episodes per API call to stay within token limits
+_MAX_API_RETRIES = 4
+_RETRY_BASE_DELAY_SECONDS = 2.0
+_RETRY_MAX_DELAY_SECONDS = 30.0
 
 
 def _build_prompt(show_name: str, season, episode_numbers: list) -> str:
@@ -297,6 +318,21 @@ def query_episode_metadata(
     return all_meta
 
 
+def _retry_delay_seconds(http_error, attempt: int) -> float:
+    """Return retry delay, honoring Retry-After when available."""
+    headers = getattr(http_error, "headers", None)
+    if headers:
+        retry_after = headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(0.0, float(retry_after))
+            except ValueError:
+                pass
+
+    delay = _RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+    return min(delay, _RETRY_MAX_DELAY_SECONDS)
+
+
 def _call_ai(prompt: str, api_key: str, base_url: str, model: str) -> dict:
     """Make a single chat-completion request and parse the JSON response.
 
@@ -334,18 +370,50 @@ def _call_ai(prompt: str, api_key: str, base_url: str, model: str) -> dict:
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        log.error("AI API HTTP error %s: %s", exc.code, exc.reason)
-        return {}
-    except urllib.error.URLError as exc:
-        log.error("AI API connection error: %s", exc.reason)
-        return {}
-    except (json.JSONDecodeError, OSError) as exc:
-        log.error("AI API response error: %s", exc)
-        return {}
+    for attempt in range(1, _MAX_API_RETRIES + 2):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+            if retryable and attempt <= _MAX_API_RETRIES:
+                delay = _retry_delay_seconds(exc, attempt)
+                log.warning(
+                    "AI API HTTP error %s: %s. Retrying in %.1fs (%d/%d).",
+                    exc.code,
+                    exc.reason,
+                    delay,
+                    attempt,
+                    _MAX_API_RETRIES,
+                )
+                time.sleep(delay)
+                continue
+
+            log.error("AI API HTTP error %s: %s", exc.code, exc.reason)
+            return {}
+        except urllib.error.URLError as exc:
+            # Retry transient network errors using exponential backoff.
+            if attempt <= _MAX_API_RETRIES:
+                delay = min(
+                    _RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                    _RETRY_MAX_DELAY_SECONDS,
+                )
+                log.warning(
+                    "AI API connection error: %s. Retrying in %.1fs (%d/%d).",
+                    exc.reason,
+                    delay,
+                    attempt,
+                    _MAX_API_RETRIES,
+                )
+                time.sleep(delay)
+                continue
+
+            log.error("AI API connection error: %s", exc.reason)
+            return {}
+        except (json.JSONDecodeError, OSError) as exc:
+            log.error("AI API response error: %s", exc)
+            return {}
 
     # Extract the assistant's text reply
     try:
@@ -525,8 +593,10 @@ def process_folder(
     base_url: str = "https://api.openai.com/v1",
     model: str = "gpt-4o-mini",
     dry_run: bool = False,
+    dry_run_folder: str = "",
 ):
     """Walk *folder*, look up IMDB metadata via AI, rename files, and write NFOs."""
+    dry_run_folder = (dry_run_folder or "").strip()
     groups = collect_episodes(folder)
 
     if not groups:
@@ -554,7 +624,9 @@ def process_folder(
         for ep_num in episode_numbers:
             filepath = episodes[ep_num]
             directory = os.path.dirname(filepath)
-            _, ext = os.path.splitext(filepath)
+            old_filename = os.path.basename(filepath)
+            stem, ext = os.path.splitext(old_filename)
+            existing_title = extract_episode_title(stem)
 
             ep_meta = metadata.get(ep_num, {})
             title = ep_meta.get("title", "")
@@ -562,20 +634,51 @@ def process_folder(
             aired = ep_meta.get("aired")
             plot = ep_meta.get("plot")
 
+            # Prefer AI metadata title, but preserve a title already present
+            # in the source filename before falling back to "Episode NN".
+            resolved_title = title if title else existing_title
+
             new_stem = build_jellyfin_name(
-                show_name, season, ep_num, title, imdb_id,
+                show_name, season, ep_num, resolved_title, imdb_id,
             )
             new_filename = new_stem + ext
-            new_filepath = os.path.join(directory, new_filename)
-            old_filename = os.path.basename(filepath)
+
+            output_directory = directory
+            if dry_run and dry_run_folder:
+                rel_dir = os.path.relpath(directory, folder)
+                output_directory = (
+                    dry_run_folder
+                    if rel_dir in ("", ".")
+                    else os.path.join(dry_run_folder, rel_dir)
+                )
+
+            new_filepath = os.path.join(output_directory, new_filename)
 
             # --- rename the video file ---
-            if new_filename == old_filename:
+            if new_filename == old_filename and not (dry_run and dry_run_folder):
                 log.info("Already compliant: %s", old_filename)
                 skipped += 1
             elif dry_run:
-                log.info("[DRY RUN] %s  →  %s", old_filename, new_filename)
-                renamed += 1
+                if dry_run_folder:
+                    os.makedirs(output_directory, exist_ok=True)
+                    if os.path.exists(new_filepath):
+                        log.warning(
+                            "Dry-run target already exists, skipping: %s  →  %s",
+                            old_filename,
+                            new_filename,
+                        )
+                        skipped += 1
+                    else:
+                        shutil.copy2(filepath, new_filepath)
+                        log.info(
+                            "[DRY RUN -> FOLDER] %s  →  %s",
+                            old_filename,
+                            os.path.relpath(new_filepath, dry_run_folder),
+                        )
+                        renamed += 1
+                else:
+                    log.info("[DRY RUN] %s  →  %s", old_filename, new_filename)
+                    renamed += 1
             elif os.path.exists(new_filepath):
                 log.warning(
                     "Target already exists, skipping: %s  →  %s",
@@ -590,13 +693,13 @@ def process_folder(
 
             # --- write the NFO sidecar ---
             # Use the title fallback consistent with the filename
-            nfo_title = title if title else f"Episode {ep_num:02d}"
+            nfo_title = resolved_title if resolved_title else f"Episode {ep_num:02d}"
             nfo_xml = build_nfo_xml(
                 show_name, season, ep_num, nfo_title,
                 imdb_id=imdb_id, aired=aired, plot=plot,
             )
-            nfo_path = os.path.join(directory, new_stem + ".nfo")
-            if write_nfo(nfo_path, nfo_xml, dry_run=dry_run):
+            nfo_path = os.path.join(output_directory, new_stem + ".nfo")
+            if write_nfo(nfo_path, nfo_xml, dry_run=(dry_run and not dry_run_folder)):
                 nfos_written += 1
 
     log.info(
@@ -641,14 +744,24 @@ def main():
     ).strip()
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
     dry_run = os.environ.get("DRY_RUN", "0").strip() == "1"
+    dry_run_folder = os.environ.get("DRY_RUN_FOLDER", "").strip()
 
     if dry_run:
         log.info("DRY RUN mode — no files will be renamed.")
+        if dry_run_folder:
+            log.info("DRY RUN folder enabled: %s", dry_run_folder)
 
     log.info("Processing folder: %s", media_folder)
     log.info("Using model: %s @ %s", model, base_url)
 
-    process_folder(media_folder, api_key, base_url, model, dry_run)
+    process_folder(
+        media_folder,
+        api_key,
+        base_url,
+        model,
+        dry_run,
+        dry_run_folder,
+    )
 
 
 if __name__ == "__main__":
