@@ -349,6 +349,26 @@ class TestCallAI(unittest.TestCase):
         self.assertEqual(result[1]["title"], "Pilot")
         self.assertEqual(mock_urlopen.call_count, 2)
 
+    @mock.patch("ai_rename.time.sleep", return_value=None)
+    @mock.patch("ai_rename.urllib.request.urlopen")
+    def test_retries_once_on_timeout_then_succeeds(self, mock_urlopen, _mock_sleep):
+        first = TimeoutError("The read operation timed out")
+        second = self._mock_response(
+            json.dumps({
+                "1": {
+                    "title": "Pilot",
+                    "imdb_id": "tt0959621",
+                    "aired": "2008-01-20",
+                    "plot": "A chemistry teacher gets a diagnosis.",
+                }
+            })
+        )
+        mock_urlopen.side_effect = [first, second]
+
+        result = _call_ai("test", self._KEY, self._BASE_URL, self._MODEL)
+        self.assertEqual(result[1]["title"], "Pilot")
+        self.assertEqual(mock_urlopen.call_count, 2)
+
 
 class TestQueryEpisodeMetadata(unittest.TestCase):
     """Unit tests for query_episode_metadata() with mocked _call_ai."""

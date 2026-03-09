@@ -25,8 +25,12 @@ Configuration is done through environment variables (or a .env file):
   OPENAI_API_KEY    API key for the OpenAI-compatible service.  (required)
   OPENAI_BASE_URL   Base URL for the API endpoint.
                     Default: https://api.openai.com/v1
-  OPENAI_MODEL      Model to use for lookups.  Default: gpt-4o-mini
-  DRY_RUN           Set to "1" to print what would be renamed without
+    OPENAI_MODEL      Model to use for lookups.  Default: gpt-4o-mini
+    OPENAI_TIMEOUT    Request timeout (seconds) for each AI API call.
+                                        Default: 60
+    OPENAI_BATCH_SIZE Episodes requested per API call.
+                                        Default: 50
+    DRY_RUN           Set to "1" to print what would be renamed without
                     actually renaming anything.  Default: 0 (off).
     DRY_RUN_FOLDER    Optional output folder used when DRY_RUN=1. If set,
                                         renamed copies and NFO files are written there, preserving
@@ -38,6 +42,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import sys
 import time
 import urllib.error
@@ -297,22 +302,25 @@ def query_episode_metadata(
     api_key: str,
     base_url: str = "https://api.openai.com/v1",
     model: str = "gpt-4o-mini",
+    request_timeout: float = 60.0,
+    batch_size: int = None,
 ) -> dict:
     """Query the AI for IMDB episode metadata.
 
     Returns ``{episode_number: {"title": str, "imdb_id": str|None,
     "aired": str|None, "plot": str|None}}``.
 
-    Large batches are split into groups of ``_BATCH_SIZE`` episodes to stay
+    Large batches are split into groups of *batch_size* episodes to stay
     within token limits.
     """
     all_meta: dict = {}
     sorted_eps = sorted(set(episode_numbers))
+    effective_batch_size = max(1, int(_BATCH_SIZE if batch_size is None else batch_size))
 
-    for i in range(0, len(sorted_eps), _BATCH_SIZE):
-        batch = sorted_eps[i : i + _BATCH_SIZE]
+    for i in range(0, len(sorted_eps), effective_batch_size):
+        batch = sorted_eps[i : i + effective_batch_size]
         prompt = _build_prompt(show_name, season, batch)
-        meta = _call_ai(prompt, api_key, base_url, model)
+        meta = _call_ai(prompt, api_key, base_url, model, request_timeout)
         all_meta.update(meta)
 
     return all_meta
@@ -333,7 +341,20 @@ def _retry_delay_seconds(http_error, attempt: int) -> float:
     return min(delay, _RETRY_MAX_DELAY_SECONDS)
 
 
-def _call_ai(prompt: str, api_key: str, base_url: str, model: str) -> dict:
+def _is_timeout_error(exc: OSError) -> bool:
+    """Return True when an exception indicates request timeout."""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def _call_ai(
+    prompt: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    request_timeout: float = 60.0,
+) -> dict:
     """Make a single chat-completion request and parse the JSON response.
 
     Returns ``{episode_number_int: {"title": str, "imdb_id": str|None,
@@ -372,7 +393,7 @@ def _call_ai(prompt: str, api_key: str, base_url: str, model: str) -> dict:
 
     for attempt in range(1, _MAX_API_RETRIES + 2):
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as exc:
@@ -411,7 +432,25 @@ def _call_ai(prompt: str, api_key: str, base_url: str, model: str) -> dict:
 
             log.error("AI API connection error: %s", exc.reason)
             return {}
-        except (json.JSONDecodeError, OSError) as exc:
+        except json.JSONDecodeError as exc:
+            log.error("AI API response error: %s", exc)
+            return {}
+        except OSError as exc:
+            if _is_timeout_error(exc) and attempt <= _MAX_API_RETRIES:
+                delay = min(
+                    _RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                    _RETRY_MAX_DELAY_SECONDS,
+                )
+                log.warning(
+                    "AI API timeout: %s. Retrying in %.1fs (%d/%d).",
+                    exc,
+                    delay,
+                    attempt,
+                    _MAX_API_RETRIES,
+                )
+                time.sleep(delay)
+                continue
+
             log.error("AI API response error: %s", exc)
             return {}
 
@@ -594,6 +633,8 @@ def process_folder(
     model: str = "gpt-4o-mini",
     dry_run: bool = False,
     dry_run_folder: str = "",
+    request_timeout: float = 60.0,
+    batch_size: int = None,
 ):
     """Walk *folder*, look up IMDB metadata via AI, rename files, and write NFOs."""
     dry_run_folder = (dry_run_folder or "").strip()
@@ -618,7 +659,14 @@ def process_folder(
         )
 
         metadata = query_episode_metadata(
-            show_name, season, episode_numbers, api_key, base_url, model,
+            show_name,
+            season,
+            episode_numbers,
+            api_key,
+            base_url,
+            model,
+            request_timeout,
+            batch_size,
         )
 
         for ep_num in episode_numbers:
@@ -745,6 +793,14 @@ def main():
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
     dry_run = os.environ.get("DRY_RUN", "0").strip() == "1"
     dry_run_folder = os.environ.get("DRY_RUN_FOLDER", "").strip()
+    try:
+        request_timeout = float(os.environ.get("OPENAI_TIMEOUT", "60").strip())
+    except ValueError:
+        request_timeout = 60.0
+    try:
+        batch_size = int(os.environ.get("OPENAI_BATCH_SIZE", str(_BATCH_SIZE)).strip())
+    except ValueError:
+        batch_size = _BATCH_SIZE
 
     if dry_run:
         log.info("DRY RUN mode — no files will be renamed.")
@@ -753,6 +809,7 @@ def main():
 
     log.info("Processing folder: %s", media_folder)
     log.info("Using model: %s @ %s", model, base_url)
+    log.info("AI timeout: %.1fs | batch size: %d", request_timeout, max(1, batch_size))
 
     process_folder(
         media_folder,
@@ -761,8 +818,11 @@ def main():
         model,
         dry_run,
         dry_run_folder,
+        request_timeout,
+        max(1, batch_size),
     )
 
 
 if __name__ == "__main__":
     main()
+
