@@ -128,7 +128,7 @@ then:
 | Show type | Output filename |
 |-----------|----------------|
 | Multi-season | `Show Name - S01E01 - Episode Title [tt0000000].ext` |
-| Single-season | `Show Name - E01 - Episode Title [tt0000000].ext` |
+| Missing-season info | `Show Name - S01E01 - Episode Title [tt0000000].ext` |
 
 When an IMDB ID is available it is appended as `[ttXXXXXXX]` for Jellyfin
 matching.  When no IMDB ID is returned the tag is omitted.
@@ -151,9 +151,9 @@ A companion `.nfo` file is created for each episode containing:
 ### Single-season / long-running shows
 
 Shows like **Naruto** or **Yu-Gi-Oh** that use a single continuous episode
-numbering with no separate seasons are supported automatically.  When no
-`Season XX` folder is found, the script treats the show as single-season
-and uses the `E01` format (no `S01` prefix).
+numbering with no separate seasons are supported automatically. When no
+`Season XX` folder is found, the script defaults the season to `1` and uses
+the `S01E01` format.
 
 ### Requirements
 
@@ -220,8 +220,8 @@ produces:
 │       ├── Breaking Bad - S01E01 - Pilot [tt0959621].mkv
 │       └── Breaking Bad - S01E01 - Pilot [tt0959621].nfo
 └── Naruto/
-    ├── Naruto - E01 - Enter: Naruto Uzumaki! [tt0409591].mkv
-    ├── Naruto - E01 - Enter: Naruto Uzumaki! [tt0409591].nfo
-    ├── Naruto - E02 - My Name is Konohamaru! [tt0409592].mkv
-    └── Naruto - E02 - My Name is Konohamaru! [tt0409592].nfo
+  ├── Naruto - S01E01 - Enter: Naruto Uzumaki! [tt0409591].mkv
+  ├── Naruto - S01E01 - Enter: Naruto Uzumaki! [tt0409591].nfo
+  ├── Naruto - S01E02 - My Name is Konohamaru! [tt0409592].mkv
+  └── Naruto - S01E02 - My Name is Konohamaru! [tt0409592].nfo
 ```

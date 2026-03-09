@@ -11,13 +11,14 @@ Files are then renamed to the Jellyfin best-practice naming scheme and a
 companion ``.nfo`` sidecar file is written with IMDB metadata so that
 Jellyfin can match and display rich episode information.
 
-  Multi-season show  →  Show Name - S01E01 - Episode Title [tt0000000].ext
-  Single-season show →  Show Name - E01 - Episode Title [tt0000000].ext
+    Multi-season show  →  Show Name - S01E01 - Episode Title [tt0000000].ext
+    Season-missing show → Show Name - S01E01 - Episode Title [tt0000000].ext
 
 When no IMDB ID is available the ``[tt…]`` tag is omitted.
 
 Shows with a single continuous run of episodes (e.g. Naruto, Yu-Gi-Oh) are
-detected automatically when there is no season folder.
+detected automatically when there is no season folder; missing season values
+are defaulted to season 1.
 
 Configuration is done through environment variables (or a .env file):
   MEDIA_FOLDER      Path to the root folder that contains the media files.
@@ -47,6 +48,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from xml.sax.saxutils import escape as xml_escape
 
 # ---------------------------------------------------------------------------
@@ -586,6 +588,12 @@ def write_nfo(nfo_path: str, xml_content: str, dry_run: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 
 def collect_episodes(folder: str) -> dict:
+    """Backward-compatible wrapper that returns validated episode groups only."""
+    groups, _unresolved = collect_episodes_with_issues(folder)
+    return groups
+
+
+def collect_episodes_with_issues(folder: str):
     """Walk *folder* and return a nested dict grouping files by show/season.
 
     Structure::
@@ -597,8 +605,15 @@ def collect_episodes(folder: str) -> dict:
             },
             ...
         }
+
+    Also returns a list of unresolved files in the form:
+
+        [(filepath, reason), ...]
+
+    Missing season information is resolved by defaulting to season 1.
     """
     groups: dict = {}
+    unresolved = []
 
     for root, _dirs, files in os.walk(folder):
         for fname in sorted(files):
@@ -612,18 +627,57 @@ def collect_episodes(folder: str) -> dict:
             show_name = infer_show_name(filepath, folder)
             if not show_name:
                 log.warning("Cannot determine show name for: %s", filepath)
+                unresolved.append((filepath, "missing show name"))
                 continue
 
             season = infer_season(filepath, folder)
+            if season is None:
+                season = 1
+
             episode = extract_episode_number(stem)
             if episode is None:
                 log.warning("Cannot determine episode number for: %s", fname)
+                unresolved.append((filepath, "missing episode number"))
                 continue
 
             key = (show_name, season)
             groups.setdefault(key, {})[episode] = filepath
 
-    return groups
+    return groups, unresolved
+
+
+def write_unresolved_report(
+    folder: str,
+    unresolved: list,
+    dry_run: bool = False,
+    dry_run_folder: str = "",
+):
+    """Write unresolved episode files to a report and return its path.
+
+    The report lists files that could not be processed because required
+    metadata (typically episode number) could not be determined.
+    """
+    if not unresolved:
+        return None
+
+    report_root = dry_run_folder if (dry_run and dry_run_folder) else folder
+    report_path = os.path.join(report_root, "unresolved_episode_info.txt")
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+
+    lines = [
+        "Unresolved episode metadata report",
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        "",
+    ]
+
+    for filepath, reason in sorted(unresolved, key=lambda item: item[0].lower()):
+        rel_path = os.path.relpath(filepath, folder)
+        lines.append(f"{rel_path} | reason: {reason}")
+
+    with open(report_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+    return report_path
 
 
 def process_folder(
@@ -638,10 +692,23 @@ def process_folder(
 ):
     """Walk *folder*, look up IMDB metadata via AI, rename files, and write NFOs."""
     dry_run_folder = (dry_run_folder or "").strip()
-    groups = collect_episodes(folder)
+    groups, unresolved = collect_episodes_with_issues(folder)
+
+    report_path = write_unresolved_report(
+        folder,
+        unresolved,
+        dry_run=dry_run,
+        dry_run_folder=dry_run_folder,
+    )
+    if report_path:
+        log.warning(
+            "Logged %d unresolved file(s) to: %s",
+            len(unresolved),
+            report_path,
+        )
 
     if not groups:
-        log.info("No video files found to process.")
+        log.info("No processable video files found.")
         return
 
     renamed = 0
@@ -751,12 +818,13 @@ def process_folder(
                 nfos_written += 1
 
     log.info(
-        "Done — %d file(s) %s, %d skipped, %d NFO(s) %s.",
+        "Done — %d file(s) %s, %d skipped, %d NFO(s) %s, %d unresolved.",
         renamed,
         "would be renamed" if dry_run else "renamed",
         skipped,
         nfos_written,
         "would be written" if dry_run else "written",
+        len(unresolved),
     )
 
 

@@ -441,8 +441,8 @@ class TestCollectEpisodes(unittest.TestCase):
         self._make_file("Naruto", "003.mkv")
         groups = collect_episodes(self.tmp)
 
-        self.assertIn(("Naruto", None), groups)
-        self.assertEqual(sorted(groups[("Naruto", None)].keys()), [1, 2, 3])
+        self.assertIn(("Naruto", 1), groups)
+        self.assertEqual(sorted(groups[("Naruto", 1)].keys()), [1, 2, 3])
 
     def test_ignores_non_video_files(self):
         self._make_file("Show", "Season 01", "S01E01.mkv")
@@ -530,7 +530,7 @@ class TestProcessFolder(unittest.TestCase):
             os.path.exists(
                 os.path.join(
                     self.tmp, "Naruto",
-                    "Naruto - E01 - Enter Naruto Uzumaki! [tt0409591].mkv",
+                    "Naruto - S01E01 - Enter Naruto Uzumaki! [tt0409591].mkv",
                 )
             )
         )
@@ -538,7 +538,7 @@ class TestProcessFolder(unittest.TestCase):
             os.path.exists(
                 os.path.join(
                     self.tmp, "Naruto",
-                    "Naruto - E02 - My Name is Konohamaru! [tt0409592].mkv",
+                    "Naruto - S01E02 - My Name is Konohamaru! [tt0409592].mkv",
                 )
             )
         )
@@ -547,7 +547,7 @@ class TestProcessFolder(unittest.TestCase):
             os.path.exists(
                 os.path.join(
                     self.tmp, "Naruto",
-                    "Naruto - E01 - Enter Naruto Uzumaki! [tt0409591].nfo",
+                    "Naruto - S01E01 - Enter Naruto Uzumaki! [tt0409591].nfo",
                 )
             )
         )
@@ -645,14 +645,14 @@ class TestProcessFolder(unittest.TestCase):
         expected = os.path.join(
             self.tmp,
             "YuGiOh 5Ds",
-            "YuGiOh 5Ds - E01 - On Your Mark, Get Set, Duel!.mkv",
+            "YuGiOh 5Ds - S01E01 - On Your Mark, Get Set, Duel!.mkv",
         )
         self.assertTrue(os.path.exists(expected))
 
         expected_nfo = os.path.join(
             self.tmp,
             "YuGiOh 5Ds",
-            "YuGiOh 5Ds - E01 - On Your Mark, Get Set, Duel!.nfo",
+            "YuGiOh 5Ds - S01E01 - On Your Mark, Get Set, Duel!.nfo",
         )
         self.assertTrue(os.path.exists(expected_nfo))
 
@@ -686,9 +686,23 @@ class TestProcessFolder(unittest.TestCase):
 
         expected = os.path.join(
             self.tmp, "Yu-Gi-Oh",
-            "Yu-Gi-Oh - E220 - The Final Duel Part 4 [tt0817076].mkv",
+            "Yu-Gi-Oh - S01E220 - The Final Duel Part 4 [tt0817076].mkv",
         )
         self.assertTrue(os.path.exists(expected))
+
+    @mock.patch("ai_rename.query_episode_metadata")
+    def test_writes_unresolved_report_for_missing_episode_number(self, mock_query):
+        self._make_file("Show", "Season 01", "Episode Title Only.mkv")
+        mock_query.return_value = {}
+
+        process_folder(self.tmp, api_key="fake")
+
+        report = os.path.join(self.tmp, "unresolved_episode_info.txt")
+        self.assertTrue(os.path.exists(report))
+        with open(report, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertIn("Show\\Season 01\\Episode Title Only.mkv", content)
+        self.assertIn("missing episode number", content)
 
     @mock.patch("ai_rename.query_episode_metadata")
     def test_no_imdb_id_omits_tag(self, mock_query):
