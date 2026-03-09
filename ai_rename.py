@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""AI-powered Jellyfin Naming & Metadata Script
+
+Uses an OpenAI-compatible language model to look up IMDB episode metadata
+for TV-show files based on:
+  • the show name    – taken from the top-level folder
+  • the season       – taken from the season folder (if present)
+  • the episode number – extracted from the filename
+
+Files are then renamed to the Jellyfin best-practice naming scheme and a
+companion ``.nfo`` sidecar file is written with IMDB metadata so that
+Jellyfin can match and display rich episode information.
+
+  Multi-season show  →  Show Name - S01E01 - Episode Title [tt0000000].ext
+  Single-season show →  Show Name - E01 - Episode Title [tt0000000].ext
+
+When no IMDB ID is available the ``[tt…]`` tag is omitted.
+
+Shows with a single continuous run of episodes (e.g. Naruto, Yu-Gi-Oh) are
+detected automatically when there is no season folder.
+
+Configuration is done through environment variables (or a .env file):
+  MEDIA_FOLDER      Path to the root folder that contains the media files.
+                    (required)
+  OPENAI_API_KEY    API key for the OpenAI-compatible service.  (required)
+  OPENAI_BASE_URL   Base URL for the API endpoint.
+                    Default: https://api.openai.com/v1
+  OPENAI_MODEL      Model to use for lookups.  Default: gpt-4o-mini
+  DRY_RUN           Set to "1" to print what would be renamed without
+                    actually renaming anything.  Default: 0 (off).
+"""
+
+import json
+import logging
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from xml.sax.saxutils import escape as xml_escape
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    format="%(levelname)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Video file extensions that will be processed
+# ---------------------------------------------------------------------------
+VIDEO_EXTENSIONS = {
+    ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv",
+    ".m4v", ".ts", ".m2ts", ".mpg", ".mpeg", ".webm",
+}
+
+# ---------------------------------------------------------------------------
+# Regex helpers
+# ---------------------------------------------------------------------------
+
+# Patterns to extract an episode number from a filename stem (tried in order)
+_EP_PATTERNS = [
+    # Standard:  S01E01  /  S1E1
+    re.compile(
+        r"[Ss](?P<season>\d{1,2})[Ee](?P<episode>\d{1,3})",
+        re.IGNORECASE,
+    ),
+    # Alternate:  1x01  /  01x01
+    re.compile(
+        r"\b(?P<season>\d{1,2})x(?P<episode>\d{2,3})\b",
+        re.IGNORECASE,
+    ),
+    # Bare episode keyword:  Ep01 / Episode 1 / ep.03
+    re.compile(
+        r"\b[Ee]p(?:isode)?\.?\s*(?P<episode>\d{1,3})\b",
+        re.IGNORECASE,
+    ),
+    # Plain number:  "001" / "01" / "1"
+    re.compile(
+        r"\b(?P<episode>\d{1,3})\b",
+    ),
+]
+
+# Detect a season number inside a folder name like "Season 01", "S2", etc.
+_SEASON_FOLDER_RE = re.compile(
+    r"[Ss](?:eason)?\s*(\d{1,2})",
+    re.IGNORECASE,
+)
+
+# Replace dots, underscores, and whitespace runs with a single space.
+_DOT_UNDER_RE = re.compile(r"[._\s]+")
+
+
+# ---------------------------------------------------------------------------
+# .env loader (same logic as rename.py)
+# ---------------------------------------------------------------------------
+
+def load_env_file(file_path: str = ".env", override: bool = False) -> int:
+    """Load environment variables from a .env-style file.
+
+    Returns the number of variables loaded.
+    """
+    if not os.path.isfile(file_path):
+        return 0
+
+    loaded = 0
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+
+                if not key:
+                    continue
+
+                if (
+                    len(value) >= 2
+                    and value[0] == value[-1]
+                    and value[0] in {'"', "'"}
+                ):
+                    value = value[1:-1]
+
+                if not override and key in os.environ:
+                    continue
+
+                os.environ[key] = value
+                loaded += 1
+    except OSError as exc:
+        log.warning("Could not read %s: %s", file_path, exc)
+
+    return loaded
+
+
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+
+def _clean(text: str) -> str:
+    """Normalise separators in a filename fragment."""
+    text = _DOT_UNDER_RE.sub(" ", text)
+    text = re.sub(r"(?:^|\s)-+|-+(?:$|\s)", " ", text)
+    return re.sub(r" {2,}", " ", text).strip()
+
+
+# ---------------------------------------------------------------------------
+# Filename / path analysis
+# ---------------------------------------------------------------------------
+
+def extract_episode_number(stem: str):
+    """Return the episode number found in *stem*, or ``None``."""
+    for pattern in _EP_PATTERNS:
+        m = pattern.search(stem)
+        if m is not None:
+            return int(m.group("episode"))
+    return None
+
+
+def parse_season_from_folder(folder_name: str):
+    """Return a season number from a folder name like ``Season 01``, or ``None``."""
+    m = _SEASON_FOLDER_RE.search(folder_name)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def infer_show_name(filepath: str, base_folder: str) -> str:
+    """Return the show name from the top-level folder under *base_folder*."""
+    rel = os.path.relpath(filepath, base_folder)
+    parts = rel.split(os.sep)
+    if len(parts) > 1:
+        return _clean(parts[0])
+    return ""
+
+
+def infer_season(filepath: str, base_folder: str):
+    """Return a season number from the directory structure, or ``None``.
+
+    Walks from the file's directory up to (but not including) the show-name
+    folder looking for a season marker.
+    """
+    rel = os.path.relpath(filepath, base_folder)
+    parts = rel.split(os.sep)
+    # parts[0] = show folder, parts[1:-1] = intermediate folders, parts[-1] = file
+    for part in parts[1:-1]:
+        season = parse_season_from_folder(part)
+        if season is not None:
+            return season
+    return None
+
+
+# ---------------------------------------------------------------------------
+# AI lookup
+# ---------------------------------------------------------------------------
+
+_BATCH_SIZE = 50  # max episodes per API call to stay within token limits
+
+
+def _build_prompt(show_name: str, season, episode_numbers: list) -> str:
+    """Build the prompt that asks the AI for IMDB episode metadata."""
+    eps = ", ".join(str(e) for e in sorted(episode_numbers))
+
+    if season is not None:
+        context = (
+            f'For the TV show "{show_name}", Season {season}, '
+            f"provide the IMDB metadata for episodes: {eps}."
+        )
+    else:
+        context = (
+            f'For the TV show "{show_name}" '
+            f"(this show uses a single continuous episode numbering with no "
+            f"separate seasons), provide the IMDB metadata for "
+            f"episodes: {eps}."
+        )
+
+    return (
+        f"{context}\n\n"
+        "Respond with ONLY a JSON object mapping episode numbers (as string "
+        "keys) to objects containing IMDB metadata.  Each value must have:\n"
+        '  "title"   – the official IMDB episode title\n'
+        '  "imdb_id" – the IMDB ID (e.g. "tt0959621"), or null if unknown\n'
+        '  "aired"   – the original air date as "YYYY-MM-DD", or null\n'
+        '  "plot"    – a short plot summary, or null\n\n'
+        "Do not include any other text.\n"
+        "Example:\n"
+        '{"1": {"title": "Pilot", "imdb_id": "tt0959621", '
+        '"aired": "2008-01-20", "plot": "A chemistry teacher is diagnosed '
+        'with cancer."}}'
+    )
+
+
+def query_episode_metadata(
+    show_name: str,
+    season,
+    episode_numbers: list,
+    api_key: str,
+    base_url: str = "https://api.openai.com/v1",
+    model: str = "gpt-4o-mini",
+) -> dict:
+    """Query the AI for IMDB episode metadata.
+
+    Returns ``{episode_number: {"title": str, "imdb_id": str|None,
+    "aired": str|None, "plot": str|None}}``.
+
+    Large batches are split into groups of ``_BATCH_SIZE`` episodes to stay
+    within token limits.
+    """
+    all_meta: dict = {}
+    sorted_eps = sorted(set(episode_numbers))
+
+    for i in range(0, len(sorted_eps), _BATCH_SIZE):
+        batch = sorted_eps[i : i + _BATCH_SIZE]
+        prompt = _build_prompt(show_name, season, batch)
+        meta = _call_ai(prompt, api_key, base_url, model)
+        all_meta.update(meta)
+
+    return all_meta
+
+
+def _call_ai(prompt: str, api_key: str, base_url: str, model: str) -> dict:
+    """Make a single chat-completion request and parse the JSON response.
+
+    Returns ``{episode_number_int: {"title": str, "imdb_id": str|None,
+    "aired": str|None, "plot": str|None}}``.
+    """
+    url = f"{base_url.rstrip('/')}/chat/completions"
+
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a TV-show metadata assistant that provides IMDB "
+                    "episode information.  When asked for episode metadata, "
+                    "respond with ONLY a valid JSON object mapping episode "
+                    "numbers (as string keys) to objects with keys: "
+                    '"title", "imdb_id", "aired", "plot".  '
+                    "No markdown, no explanation."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        log.error("AI API HTTP error %s: %s", exc.code, exc.reason)
+        return {}
+    except urllib.error.URLError as exc:
+        log.error("AI API connection error: %s", exc.reason)
+        return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        log.error("AI API response error: %s", exc)
+        return {}
+
+    # Extract the assistant's text reply
+    try:
+        text = body["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError):
+        log.error("Unexpected AI API response structure.")
+        return {}
+
+    # Strip markdown code fences if the model wraps its answer
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError:
+        log.error("AI returned invalid JSON: %s", text[:200])
+        return {}
+
+    if not isinstance(raw, dict):
+        log.error("AI returned non-object JSON: %s", type(raw).__name__)
+        return {}
+
+    # Normalise into {int: {title, imdb_id, aired, plot}}
+    result: dict = {}
+    for k, v in raw.items():
+        ep = int(k)
+        if isinstance(v, dict):
+            result[ep] = {
+                "title": str(v.get("title") or ""),
+                "imdb_id": v.get("imdb_id") or None,
+                "aired": v.get("aired") or None,
+                "plot": str(v.get("plot") or "") if v.get("plot") else None,
+            }
+        else:
+            # Graceful fallback: if the model returns a plain string title
+            result[ep] = {
+                "title": str(v),
+                "imdb_id": None,
+                "aired": None,
+                "plot": None,
+            }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Filename building
+# ---------------------------------------------------------------------------
+
+def build_jellyfin_name(
+    show_name: str, season, episode: int, episode_title: str,
+    imdb_id: str = None,
+) -> str:
+    """Construct the Jellyfin-compliant filename stem.
+
+    When *imdb_id* is provided the ``[ttXXXXXXX]`` tag is appended
+    so Jellyfin can match the file to the correct IMDB entry.
+    """
+    if not episode_title:
+        episode_title = f"Episode {episode:02d}"
+
+    if season is not None:
+        ep_marker = f"S{season:02d}E{episode:02d}"
+    else:
+        ep_marker = f"E{episode:02d}"
+
+    if show_name:
+        stem = f"{show_name} - {ep_marker} - {episode_title}"
+    else:
+        stem = f"{ep_marker} - {episode_title}"
+
+    if imdb_id:
+        stem = f"{stem} [{imdb_id}]"
+
+    return stem
+
+
+# ---------------------------------------------------------------------------
+# NFO sidecar generation
+# ---------------------------------------------------------------------------
+
+def build_nfo_xml(
+    show_name: str,
+    season,
+    episode: int,
+    title: str,
+    imdb_id: str = None,
+    aired: str = None,
+    plot: str = None,
+) -> str:
+    """Return the XML content for a Jellyfin/Kodi-style episode .nfo file."""
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<episodedetails>",
+        f"  <title>{xml_escape(title)}</title>",
+        f"  <showtitle>{xml_escape(show_name)}</showtitle>",
+    ]
+    if season is not None:
+        lines.append(f"  <season>{season}</season>")
+    lines.append(f"  <episode>{episode}</episode>")
+    if imdb_id:
+        lines.append(
+            f'  <uniqueid type="imdb" default="true">{xml_escape(imdb_id)}</uniqueid>'
+        )
+    if aired:
+        lines.append(f"  <aired>{xml_escape(aired)}</aired>")
+    if plot:
+        lines.append(f"  <plot>{xml_escape(plot)}</plot>")
+    lines.append("</episodedetails>")
+    return "\n".join(lines) + "\n"
+
+
+def write_nfo(nfo_path: str, xml_content: str, dry_run: bool = False) -> bool:
+    """Write an NFO sidecar file.  Returns ``True`` if written."""
+    if dry_run:
+        log.info("[DRY RUN] Would write NFO: %s", os.path.basename(nfo_path))
+        return True
+    if os.path.exists(nfo_path):
+        log.info("NFO already exists, skipping: %s", os.path.basename(nfo_path))
+        return False
+    with open(nfo_path, "w", encoding="utf-8") as fh:
+        fh.write(xml_content)
+    log.info("Wrote NFO: %s", os.path.basename(nfo_path))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Core processing
+# ---------------------------------------------------------------------------
+
+def collect_episodes(folder: str) -> dict:
+    """Walk *folder* and return a nested dict grouping files by show/season.
+
+    Structure::
+
+        {
+            (show_name, season_or_None): {
+                episode_number: filepath,
+                ...
+            },
+            ...
+        }
+    """
+    groups: dict = {}
+
+    for root, _dirs, files in os.walk(folder):
+        for fname in sorted(files):
+            _, ext = os.path.splitext(fname)
+            if ext.lower() not in VIDEO_EXTENSIONS:
+                continue
+
+            filepath = os.path.join(root, fname)
+            stem, _ = os.path.splitext(fname)
+
+            show_name = infer_show_name(filepath, folder)
+            if not show_name:
+                log.warning("Cannot determine show name for: %s", filepath)
+                continue
+
+            season = infer_season(filepath, folder)
+            episode = extract_episode_number(stem)
+            if episode is None:
+                log.warning("Cannot determine episode number for: %s", fname)
+                continue
+
+            key = (show_name, season)
+            groups.setdefault(key, {})[episode] = filepath
+
+    return groups
+
+
+def process_folder(
+    folder: str,
+    api_key: str,
+    base_url: str = "https://api.openai.com/v1",
+    model: str = "gpt-4o-mini",
+    dry_run: bool = False,
+):
+    """Walk *folder*, look up IMDB metadata via AI, rename files, and write NFOs."""
+    groups = collect_episodes(folder)
+
+    if not groups:
+        log.info("No video files found to process.")
+        return
+
+    renamed = 0
+    skipped = 0
+    nfos_written = 0
+
+    for (show_name, season), episodes in sorted(groups.items()):
+        episode_numbers = sorted(episodes.keys())
+        season_label = f"Season {season}" if season is not None else "single-season"
+        log.info(
+            "Looking up IMDB metadata for %d episode(s) of '%s' (%s) …",
+            len(episode_numbers),
+            show_name,
+            season_label,
+        )
+
+        metadata = query_episode_metadata(
+            show_name, season, episode_numbers, api_key, base_url, model,
+        )
+
+        for ep_num in episode_numbers:
+            filepath = episodes[ep_num]
+            directory = os.path.dirname(filepath)
+            _, ext = os.path.splitext(filepath)
+
+            ep_meta = metadata.get(ep_num, {})
+            title = ep_meta.get("title", "")
+            imdb_id = ep_meta.get("imdb_id")
+            aired = ep_meta.get("aired")
+            plot = ep_meta.get("plot")
+
+            new_stem = build_jellyfin_name(
+                show_name, season, ep_num, title, imdb_id,
+            )
+            new_filename = new_stem + ext
+            new_filepath = os.path.join(directory, new_filename)
+            old_filename = os.path.basename(filepath)
+
+            # --- rename the video file ---
+            if new_filename == old_filename:
+                log.info("Already compliant: %s", old_filename)
+                skipped += 1
+            elif dry_run:
+                log.info("[DRY RUN] %s  →  %s", old_filename, new_filename)
+                renamed += 1
+            elif os.path.exists(new_filepath):
+                log.warning(
+                    "Target already exists, skipping: %s  →  %s",
+                    old_filename,
+                    new_filename,
+                )
+                skipped += 1
+            else:
+                os.rename(filepath, new_filepath)
+                log.info("Renamed: %s  →  %s", old_filename, new_filename)
+                renamed += 1
+
+            # --- write the NFO sidecar ---
+            # Use the title fallback consistent with the filename
+            nfo_title = title if title else f"Episode {ep_num:02d}"
+            nfo_xml = build_nfo_xml(
+                show_name, season, ep_num, nfo_title,
+                imdb_id=imdb_id, aired=aired, plot=plot,
+            )
+            nfo_path = os.path.join(directory, new_stem + ".nfo")
+            if write_nfo(nfo_path, nfo_xml, dry_run=dry_run):
+                nfos_written += 1
+
+    log.info(
+        "Done — %d file(s) %s, %d skipped, %d NFO(s) %s.",
+        renamed,
+        "would be renamed" if dry_run else "renamed",
+        skipped,
+        nfos_written,
+        "would be written" if dry_run else "written",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    load_env_file()
+
+    media_folder = os.environ.get("MEDIA_FOLDER", "").strip()
+    if not media_folder:
+        log.error(
+            "MEDIA_FOLDER environment variable is not set. "
+            "Please set it to the path of the folder to process."
+        )
+        sys.exit(1)
+
+    if not os.path.isdir(media_folder):
+        log.error("MEDIA_FOLDER does not point to a directory: %s", media_folder)
+        sys.exit(1)
+
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        log.error(
+            "OPENAI_API_KEY environment variable is not set. "
+            "An API key is required to look up episode titles."
+        )
+        sys.exit(1)
+
+    base_url = os.environ.get(
+        "OPENAI_BASE_URL", "https://api.openai.com/v1"
+    ).strip()
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+    dry_run = os.environ.get("DRY_RUN", "0").strip() == "1"
+
+    if dry_run:
+        log.info("DRY RUN mode — no files will be renamed.")
+
+    log.info("Processing folder: %s", media_folder)
+    log.info("Using model: %s @ %s", model, base_url)
+
+    process_folder(media_folder, api_key, base_url, model, dry_run)
+
+
+if __name__ == "__main__":
+    main()
