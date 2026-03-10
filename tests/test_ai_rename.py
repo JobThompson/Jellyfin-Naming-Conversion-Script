@@ -19,14 +19,24 @@ from ai_rename import (
     infer_show_name,
     infer_season,
     build_jellyfin_name,
+    build_movie_name,
     build_nfo_xml,
+    build_movie_nfo_xml,
     write_nfo,
     collect_episodes,
+    collect_movies,
     process_folder,
     load_env_file,
+    setup_api_logger,
     _build_prompt,
+    _build_movie_prompt,
     _call_ai,
+    _call_movie_ai,
+    _chat_completion,
+    _log_episode_table,
+    _log_movie_table,
     query_episode_metadata,
+    query_movie_metadata,
 )
 
 
@@ -737,6 +747,384 @@ class TestLoadEnvFile(unittest.TestCase):
             loaded = load_env_file(self.env_path)
             self.assertEqual(loaded, 1)
             self.assertEqual(os.environ.get("OPENAI_API_KEY"), "sk-test123")
+
+
+class TestBuildMovieName(unittest.TestCase):
+    """Unit tests for build_movie_name()."""
+
+    def test_full_metadata(self):
+        name = build_movie_name("The Shawshank Redemption", 1994, "tt0111161")
+        self.assertEqual(name, "The Shawshank Redemption (1994) [tt0111161]")
+
+    def test_no_year(self):
+        name = build_movie_name("Unknown Film", None, "tt9999999")
+        self.assertEqual(name, "Unknown Film [tt9999999]")
+
+    def test_no_imdb_id(self):
+        name = build_movie_name("Some Movie", 2020, None)
+        self.assertEqual(name, "Some Movie (2020)")
+
+    def test_title_only(self):
+        name = build_movie_name("Some Movie", None, None)
+        self.assertEqual(name, "Some Movie")
+
+    def test_empty_title_fallback(self):
+        name = build_movie_name("", 2020, None)
+        self.assertEqual(name, "Unknown Movie (2020)")
+
+    def test_special_chars_cleaned(self):
+        name = build_movie_name("Movie: The \"Sequel\"", 2021, None)
+        self.assertNotIn(":", name)
+        self.assertNotIn('"', name)
+
+
+class TestBuildMovieNfoXml(unittest.TestCase):
+    """Unit tests for build_movie_nfo_xml()."""
+
+    def test_full_metadata(self):
+        xml = build_movie_nfo_xml(
+            "The Shawshank Redemption",
+            year=1994,
+            imdb_id="tt0111161",
+            plot="Two imprisoned men bond over years.",
+        )
+        root = ElementTree.fromstring(xml)
+        self.assertEqual(root.tag, "movie")
+        self.assertEqual(root.find("title").text, "The Shawshank Redemption")
+        self.assertEqual(root.find("year").text, "1994")
+        uid = root.find("uniqueid")
+        self.assertEqual(uid.text, "tt0111161")
+        self.assertEqual(uid.get("type"), "imdb")
+        self.assertIn("bond", root.find("plot").text)
+
+    def test_minimal_metadata(self):
+        xml = build_movie_nfo_xml("Unknown Movie")
+        root = ElementTree.fromstring(xml)
+        self.assertEqual(root.find("title").text, "Unknown Movie")
+        self.assertIsNone(root.find("year"))
+        self.assertIsNone(root.find("uniqueid"))
+        self.assertIsNone(root.find("plot"))
+
+    def test_special_chars_escaped(self):
+        xml = build_movie_nfo_xml("Tom & Jerry: The Movie")
+        root = ElementTree.fromstring(xml)
+        self.assertEqual(root.find("title").text, "Tom & Jerry: The Movie")
+
+
+class TestBuildMoviePrompt(unittest.TestCase):
+    """Unit tests for _build_movie_prompt()."""
+
+    def test_contains_filenames(self):
+        prompt = _build_movie_prompt(["Inception.2010.mkv", "Memento.mkv"])
+        self.assertIn("Inception.2010.mkv", prompt)
+        self.assertIn("Memento.mkv", prompt)
+        self.assertIn("IMDB", prompt)
+        self.assertIn("title", prompt)
+        self.assertIn("year", prompt)
+
+    def test_single_filename(self):
+        prompt = _build_movie_prompt(["Arrival.2016.mkv"])
+        self.assertIn("Arrival.2016.mkv", prompt)
+
+
+class TestCallMovieAI(unittest.TestCase):
+    """Unit tests for _call_movie_ai() with mocked HTTP responses."""
+
+    _BASE_URL = "https://api.openai.com/v1"
+    _MODEL = "gpt-4o-mini"
+    _KEY = "fake-key"
+
+    def _mock_response(self, content_text):
+        body = json.dumps({
+            "choices": [{
+                "message": {"content": content_text}
+            }]
+        }).encode("utf-8")
+        resp = mock.MagicMock()
+        resp.read.return_value = body
+        resp.__enter__ = mock.MagicMock(return_value=resp)
+        resp.__exit__ = mock.MagicMock(return_value=False)
+        return resp
+
+    @mock.patch("ai_rename.urllib.request.urlopen")
+    def test_valid_movie_response(self, mock_urlopen):
+        mock_urlopen.return_value = self._mock_response(
+            json.dumps({
+                "Inception.2010.mkv": {
+                    "title": "Inception",
+                    "year": 2010,
+                    "imdb_id": "tt1375666",
+                    "plot": "A thief enters dreams.",
+                }
+            })
+        )
+        result = _call_movie_ai("test", self._KEY, self._BASE_URL, self._MODEL)
+        self.assertEqual(result["Inception.2010.mkv"]["title"], "Inception")
+        self.assertEqual(result["Inception.2010.mkv"]["year"], 2010)
+        self.assertEqual(result["Inception.2010.mkv"]["imdb_id"], "tt1375666")
+
+    @mock.patch("ai_rename.urllib.request.urlopen")
+    def test_fallback_plain_string(self, mock_urlopen):
+        mock_urlopen.return_value = self._mock_response(
+            '{"Inception.mkv": "Inception"}'
+        )
+        result = _call_movie_ai("test", self._KEY, self._BASE_URL, self._MODEL)
+        self.assertEqual(result["Inception.mkv"]["title"], "Inception")
+        self.assertIsNone(result["Inception.mkv"]["year"])
+        self.assertIsNone(result["Inception.mkv"]["imdb_id"])
+
+
+class TestQueryMovieMetadata(unittest.TestCase):
+    """Unit tests for query_movie_metadata() with mocked _call_movie_ai."""
+
+    _BASE_URL = "https://api.openai.com/v1"
+    _MODEL = "gpt-4o-mini"
+    _KEY = "fake-key"
+
+    @mock.patch("ai_rename._call_movie_ai")
+    def test_single_batch(self, mock_call):
+        mock_call.return_value = {
+            "Inception.mkv": {
+                "title": "Inception",
+                "year": 2010,
+                "imdb_id": "tt1375666",
+                "plot": None,
+            },
+        }
+        result = query_movie_metadata(
+            ["Inception.mkv"], self._KEY, self._BASE_URL, self._MODEL,
+        )
+        self.assertEqual(result["Inception.mkv"]["title"], "Inception")
+        mock_call.assert_called_once()
+
+
+class TestCollectMovies(unittest.TestCase):
+    """Unit tests for collect_movies()."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _make_file(self, *path_parts):
+        path = os.path.join(self.tmp, *path_parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w"):
+            pass
+        return path
+
+    def test_detects_root_video_files(self):
+        self._make_file("Inception.mkv")
+        self._make_file("Memento.mp4")
+        movies = collect_movies(self.tmp)
+        basenames = [os.path.basename(f) for f in movies]
+        self.assertIn("Inception.mkv", basenames)
+        self.assertIn("Memento.mp4", basenames)
+        self.assertEqual(len(movies), 2)
+
+    def test_ignores_subdirectory_files(self):
+        self._make_file("Show", "Season 01", "S01E01.mkv")
+        self._make_file("Movie.mkv")
+        movies = collect_movies(self.tmp)
+        basenames = [os.path.basename(f) for f in movies]
+        self.assertEqual(basenames, ["Movie.mkv"])
+
+    def test_ignores_non_video_files(self):
+        self._make_file("readme.txt")
+        self._make_file("data.json")
+        movies = collect_movies(self.tmp)
+        self.assertEqual(movies, [])
+
+    def test_ignores_directories(self):
+        os.makedirs(os.path.join(self.tmp, "SomeFolder"))
+        movies = collect_movies(self.tmp)
+        self.assertEqual(movies, [])
+
+
+class TestLogEpisodeTable(unittest.TestCase):
+    """Unit tests for _log_episode_table()."""
+
+    def test_logs_correct_format(self):
+        metadata = {
+            1: {"title": "Pilot", "imdb_id": "tt0959621", "aired": "2008-01-20", "plot": None},
+        }
+        episodes = {
+            1: os.path.join("some", "path", "S01E01.mkv"),
+        }
+        # Should not raise and should produce log output
+        with mock.patch("ai_rename.log") as mock_log:
+            _log_episode_table("Show", 1, metadata, episodes)
+            # At least the header + column header + separator + 1 row = 4 calls
+            self.assertGreaterEqual(mock_log.info.call_count, 4)
+
+    def test_truncates_long_titles(self):
+        metadata = {
+            1: {
+                "title": "A Very Long Episode Title That Exceeds Thirty Characters",
+                "imdb_id": None,
+                "aired": None,
+                "plot": None,
+            },
+        }
+        episodes = {1: os.path.join("path", "S01E01.mkv")}
+        with mock.patch("ai_rename.log") as mock_log:
+            _log_episode_table("Show", 1, metadata, episodes)
+            # Find the data row call (last info call)
+            last_call_args = mock_log.info.call_args_list[-1]
+            formatted = last_call_args[0][0] % last_call_args[0][1:]
+            self.assertIn("...", formatted)
+
+
+class TestLogMovieTable(unittest.TestCase):
+    """Unit tests for _log_movie_table()."""
+
+    def test_logs_correct_format(self):
+        metadata = {
+            "Inception.mkv": {
+                "title": "Inception",
+                "year": 2010,
+                "imdb_id": "tt1375666",
+                "plot": None,
+            },
+        }
+        filepaths = [os.path.join("root", "Inception.mkv")]
+        with mock.patch("ai_rename.log") as mock_log:
+            _log_movie_table(metadata, filepaths)
+            # header + column header + separator + 1 row = 4 calls
+            self.assertGreaterEqual(mock_log.info.call_count, 4)
+
+
+class TestSetupApiLogger(unittest.TestCase):
+    """Unit tests for setup_api_logger()."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        # Remove any handlers we added to avoid leaking between tests
+        import ai_rename
+        ai_rename.api_log.handlers.clear()
+        shutil.rmtree(self.tmp)
+
+    def test_creates_log_file(self):
+        log_dir = os.path.join(self.tmp, "logs")
+        path = setup_api_logger(log_dir)
+        self.assertTrue(os.path.isdir(log_dir))
+        self.assertTrue(path.endswith(".log"))
+        self.assertIn("ai_rename_", os.path.basename(path))
+
+    def test_logger_writes_to_file(self):
+        import ai_rename
+        log_dir = os.path.join(self.tmp, "logs")
+        path = setup_api_logger(log_dir)
+        ai_rename.api_log.debug("TEST_API_MESSAGE")
+        # Flush handlers
+        for h in ai_rename.api_log.handlers:
+            h.flush()
+        with open(path, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertIn("TEST_API_MESSAGE", content)
+
+
+class TestProcessFolderMovies(unittest.TestCase):
+    """Integration tests for movie processing in process_folder()."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _make_file(self, *path_parts):
+        path = os.path.join(self.tmp, *path_parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w"):
+            pass
+        return path
+
+    @mock.patch("ai_rename.query_movie_metadata")
+    @mock.patch("ai_rename.query_episode_metadata")
+    def test_renames_movie_with_metadata(self, mock_ep_query, mock_mv_query):
+        self._make_file("Inception.2010.mkv")
+        mock_ep_query.return_value = {}
+        mock_mv_query.return_value = {
+            "Inception.2010.mkv": {
+                "title": "Inception",
+                "year": 2010,
+                "imdb_id": "tt1375666",
+                "plot": "A thief enters dreams.",
+            },
+        }
+
+        process_folder(self.tmp, api_key="fake")
+
+        expected_video = os.path.join(
+            self.tmp, "Inception (2010) [tt1375666].mkv",
+        )
+        self.assertTrue(os.path.exists(expected_video))
+
+        expected_nfo = os.path.join(
+            self.tmp, "Inception (2010) [tt1375666].nfo",
+        )
+        self.assertTrue(os.path.exists(expected_nfo))
+        root = ElementTree.parse(expected_nfo).getroot()
+        self.assertEqual(root.tag, "movie")
+        self.assertEqual(root.find("title").text, "Inception")
+        self.assertEqual(root.find("year").text, "2010")
+        self.assertEqual(root.find("uniqueid").text, "tt1375666")
+
+    @mock.patch("ai_rename.query_movie_metadata")
+    @mock.patch("ai_rename.query_episode_metadata")
+    def test_movie_dry_run_no_rename(self, mock_ep_query, mock_mv_query):
+        fp = self._make_file("SomeMovie.mkv")
+        mock_ep_query.return_value = {}
+        mock_mv_query.return_value = {
+            "SomeMovie.mkv": {
+                "title": "Some Movie",
+                "year": 2020,
+                "imdb_id": "tt9999999",
+                "plot": None,
+            },
+        }
+
+        process_folder(self.tmp, api_key="fake", dry_run=True)
+
+        # Original still exists
+        self.assertTrue(os.path.exists(fp))
+        # New file does NOT exist
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.tmp, "Some Movie (2020) [tt9999999].mkv")
+            )
+        )
+
+    @mock.patch("ai_rename.query_movie_metadata")
+    @mock.patch("ai_rename.query_episode_metadata")
+    def test_movie_dry_run_folder_writes(self, mock_ep_query, mock_mv_query):
+        fp = self._make_file("SomeMovie.mkv")
+        dry_out = os.path.join(self.tmp, "_dryrun")
+        mock_ep_query.return_value = {}
+        mock_mv_query.return_value = {
+            "SomeMovie.mkv": {
+                "title": "Some Movie",
+                "year": 2020,
+                "imdb_id": "tt9999999",
+                "plot": None,
+            },
+        }
+
+        process_folder(
+            self.tmp, api_key="fake", dry_run=True, dry_run_folder=dry_out,
+        )
+
+        # Original untouched
+        self.assertTrue(os.path.exists(fp))
+        # Staged outputs created
+        staged = os.path.join(dry_out, "Some Movie (2020) [tt9999999].mkv")
+        self.assertTrue(os.path.exists(staged))
+        staged_nfo = os.path.join(dry_out, "Some Movie (2020) [tt9999999].nfo")
+        self.assertTrue(os.path.exists(staged_nfo))
 
 
 if __name__ == "__main__":
